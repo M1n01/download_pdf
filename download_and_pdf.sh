@@ -1,7 +1,8 @@
 #!/bin/bash
 # 使い方: ./document_pdf.sh <base_url>
 # 例: ./document_pdf.sh https://nextjs.org/docs/app
-# 指定したURLのサイトマップからサブディレクトリを取得し、PDFに変換するスクリプト
+# 単一URLをPDFに変換するスクリプト（デフォルト）
+# または、指定したURLのサイトマップからサブディレクトリを取得し、PDFに変換する
 
 set -e  # エラー発生時に停止
 trap 'echo "スクリプトが中断されました"; cleanup' INT TERM EXIT
@@ -25,6 +26,7 @@ DEBUG_MODE=false
 TEMP_SITEMAP="sitemap.xml"
 TEMP_URLS="urls.txt"
 TIMEOUT_SEC=60
+SINGLE_PAGE_MODE=true  # デフォルトを単一ページモードに変更
 
 #####################################
 # step1. 引数チェック
@@ -37,10 +39,13 @@ show_help() {
   -h, --help         このヘルプを表示
   -o, --output DIR   PDFの出力先ディレクトリを指定 (デフォルト: $HOME/Downloads/<ドメイン名>)
   -d, --debug        デバッグモード（一時ファイルを保持）
+  -s, --single       単一ページモード（指定されたURLのみをPDFに変換）[デフォルト]
+  -m, --multi        複数ページモード（サイトマップから複数ページを変換）
 
 例:
-  $0 https://nextjs.org/docs/app
-  $0 --output ./docs_pdf https://nextjs.org/docs/app
+  $0 https://nextjs.org/docs/app/start  # 単一ページのみPDF化（デフォルト）
+  $0 --multi https://nextjs.org/docs/app # サイトマップから全ページを取得しPDF化
+  $0 --output ./docs_pdf https://nextjs.org/docs/app/start
 EOF
     exit 0
 }
@@ -49,6 +54,7 @@ EOF
 BASE_URL=""
 OUTPUT_DIR=""
 WAIT_TIME=0.1
+MULTI_PAGE_MODE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -61,6 +67,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         -d|--debug)
             DEBUG_MODE=true
+            shift
+            ;;
+        -s|--single)
+            SINGLE_PAGE_MODE=true
+            shift
+            ;;
+        -m|--multi)
+            SINGLE_PAGE_MODE=false
+            MULTI_PAGE_MODE=true
             shift
             ;;
         -w|--wait)
@@ -202,7 +217,46 @@ mkdir -p "$OUTPUT_DIR"
 echo "PDFの出力先: $OUTPUT_DIR"
 
 #####################################
-# step4. サイトマップの確認
+# step4. PDF変換関数
+#####################################
+# PDF変換関数（タイムアウト処理を含む）
+convert_to_pdf() {
+    local url="$1"
+    local output_path="$2"
+    
+    if [ "$TIMEOUT_CMD" = "timeout_function" ]; then
+        # 簡易タイムアウト関数を使用
+        timeout_function "$TIMEOUT_SEC" "$CHROME_PATH --headless --disable-gpu --print-to-pdf=\"$output_path\" \"$url\" 2>/dev/null"
+    else
+        # 通常のタイムアウトコマンドを使用
+        $TIMEOUT_CMD "$TIMEOUT_SEC" "$CHROME_PATH" --headless --disable-gpu --print-to-pdf="$output_path" "$url" 2>/dev/null
+    fi
+    
+    return $?
+}
+
+#####################################
+# step5. 単一ページモードの処理
+#####################################
+if [ "$SINGLE_PAGE_MODE" = true ]; then
+    echo "単一ページモード: $BASE_URL をPDF化します"
+    
+    # ファイル名生成（URLからパスを抽出、スラッシュを_に置換）
+    filename=$(echo "$BASE_URL" | sed "s|https://||" | sed "s|http://||" | sed 's/[\/\?&=]/_/g').pdf
+    output_path="$OUTPUT_DIR/$filename"
+    
+    echo "PDF化中: $BASE_URL → $output_path"
+    if convert_to_pdf "$BASE_URL" "$output_path"; then
+        echo "✓ PDF作成成功: $output_path"
+        exit 0
+    else
+        echo "✗ PDF作成失敗: $BASE_URL"
+        exit 1
+    fi
+fi
+
+#####################################
+# step6. サイトマップの確認
 #####################################
 echo "サイトマップをチェック中: $BASE_URL/sitemap.xml"
 
@@ -229,7 +283,7 @@ if ! curl -s "$SITEMAP_URL" -o "$TEMP_SITEMAP"; then
 fi
 
 #####################################
-# step5. サイトマップからURLを取得
+# step7. サイトマップからURLを取得
 #####################################
 echo "サイトマップから $BASE_URL のサブディレクトリのURLを取得しています..."
 
@@ -252,25 +306,9 @@ fi
 echo "合計 $URL_COUNT 件のURLを取得しました。"
 
 #####################################
-# step6. URLからPDFを生成
+# step8. URLからPDFを生成
 #####################################
 echo "PDFの生成を開始します..."
-
-# PDF変換関数（タイムアウト処理を含む）
-convert_to_pdf() {
-    local url="$1"
-    local output_path="$2"
-    
-    if [ "$TIMEOUT_CMD" = "timeout_function" ]; then
-        # 簡易タイムアウト関数を使用
-        timeout_function "$TIMEOUT_SEC" "$CHROME_PATH --headless --disable-gpu --print-to-pdf=\"$output_path\" \"$url\" 2>/dev/null"
-    else
-        # 通常のタイムアウトコマンドを使用
-        $TIMEOUT_CMD "$TIMEOUT_SEC" "$CHROME_PATH" --headless --disable-gpu --print-to-pdf="$output_path" "$url" 2>/dev/null
-    fi
-    
-    return $?
-}
 
 COUNTER=0
 SUCCESS=0
@@ -318,7 +356,7 @@ while IFS= read -r url; do
 done < "$TEMP_URLS"
 
 #####################################
-# step7. 結果の表示
+# step9. 結果の表示
 #####################################
 END_TIME=$(date +%s)
 TOTAL_TIME=$((END_TIME - START_TIME))
