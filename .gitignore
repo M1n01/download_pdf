@@ -1,2 +1,5 @@
 sitemap.xml
 urls.txt
+
+.vscode/*
+!.vscode/settings.json

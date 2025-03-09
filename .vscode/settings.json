@@ -1,0 +1,10 @@
+{
+  "github.copilot.chat.codeGeneration.instructions": [
+    {
+      "file": ".github/prompts/00_basic.md"
+    },
+    {
+      "text": "日本語で出力して"
+    }
+  ]
+}
