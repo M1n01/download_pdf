@@ -4,7 +4,7 @@
 # 指定したURLのサイトマップからサブディレクトリを取得し、PDFに変換するスクリプト
 
 set -e  # エラー発生時に停止
-trap 'echo "スクリプトが中断されました"; cleanup' INT TERM EXIT
+trap 'echo "スクリプトが中断されました"; kill 0; cleanup' INT TERM EXIT
 
 # 一時ファイルのクリーンアップ
 cleanup() {
@@ -25,6 +25,8 @@ DEBUG_MODE=false
 TEMP_SITEMAP="sitemap.xml"
 TEMP_URLS="urls.txt"
 TIMEOUT_SEC=60
+MERGE_PDFS=false
+MERGED_FILENAME=""
 
 #####################################
 # step1. 引数チェック
@@ -37,10 +39,13 @@ show_help() {
   -h, --help         このヘルプを表示
   -o, --output DIR   PDFの出力先ディレクトリを指定 (デフォルト: $HOME/Downloads/<ドメイン名>)
   -d, --debug        デバッグモード（一時ファイルを保持）
+  -w, --wait SEC     ページ間の待機時間（秒）(デフォルト: 1)
+  -m, --merge        生成したPDFを1つのファイルにまとめる
+  -f, --filename NAME 結合後のPDFファイル名 (デフォルト: <ドメイン名>_merged.pdf)
 
 例:
   $0 https://nextjs.org/docs/app
-  $0 --output ./docs_pdf https://nextjs.org/docs/app
+  $0 --output ./docs_pdf --merge https://nextjs.org/docs/app
 EOF
     exit 0
 }
@@ -48,7 +53,7 @@ EOF
 # コマンドライン引数の解析
 BASE_URL=""
 OUTPUT_DIR=""
-WAIT_TIME=0.1
+WAIT_TIME=1
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -65,6 +70,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         -w|--wait)
             WAIT_TIME="$2"
+            shift 2
+            ;;
+        -m|--merge)
+            MERGE_PDFS=true
+            shift
+            ;;
+        -f|--filename)
+            MERGED_FILENAME="$2"
             shift 2
             ;;
         -*)
@@ -90,6 +103,11 @@ BASE_URL=${BASE_URL%/}
 # ドメイン名を抽出
 DOMAIN=$(echo "$BASE_URL" | sed -E 's#https?://([^/]+).*#\1#')
 
+# PDFマージのデフォルトファイル名設定
+if [ "$MERGE_PDFS" = true ] && [ -z "$MERGED_FILENAME" ]; then
+    MERGED_FILENAME="${DOMAIN}_merged.pdf"
+fi
+
 #####################################
 # step2. 必要なコマンドのチェック
 #####################################
@@ -114,6 +132,24 @@ check_command "curl" "URLからデータを転送するツール" || MISSING_TOO
 check_command "grep" "テキストパターンを検索するツール" || MISSING_TOOLS=$((MISSING_TOOLS+1))
 check_command "sed" "テキストストリームを変換・解析するツール" || MISSING_TOOLS=$((MISSING_TOOLS+1))
 check_command "awk" "テキスト処理ツール" || MISSING_TOOLS=$((MISSING_TOOLS+1))
+
+# PDFマージが有効な場合、必要なツールをチェック
+if [ "$MERGE_PDFS" = true ]; then
+    # ghostscriptかpdftk、どちらかが必要
+    if command -v gs >/dev/null 2>&1; then
+        PDF_MERGE_TOOL="gs"
+        echo "✓ ghostscript: インストール済み (PDF結合ツール)"
+    elif command -v pdftk >/dev/null 2>&1; then
+        PDF_MERGE_TOOL="pdftk"
+        echo "✓ pdftk: インストール済み (PDF結合ツール)"
+    else
+        echo "エラー: PDF結合に必要なツール (ghostscript または pdftk) がインストールされていません。"
+        echo "  インストール方法:"
+        echo "    macOS: brew install ghostscript または brew install pdftk-java"
+        echo "    Linux: apt-get install ghostscript または apt-get install pdftk"
+        MISSING_TOOLS=$((MISSING_TOOLS+1))
+    fi
+fi
 
 # Google Chromeの検出（複数の可能性のあるパスをチェック）
 CHROME_PATHS=(
@@ -215,7 +251,7 @@ if ! curl -s --head "$SITEMAP_URL" | grep -q "200 OK"; then
     SITEMAP_URL="https://$DOMAIN/sitemap.xml"
     echo "サブディレクトリにサイトマップが見つかりません。ドメインルートをチェック: $SITEMAP_URL"
     
-    if ! curl -s --head "$SITEMAP_URL" | grep -q "200"; then
+    if ! curl -s --head "$SITEMAP_URL" | grep -q "200 OK"; then
         echo "エラー: サイトマップが見つかりません。処理を終了します。"
         exit 1
     fi
@@ -255,19 +291,26 @@ echo "合計 $URL_COUNT 件のURLを取得しました。"
 # step6. URLからPDFを生成
 #####################################
 echo "PDFの生成を開始します..."
+# PDF生成用の一時リストファイル (PDFマージ用)
+PDF_LIST="$OUTPUT_DIR/pdf_files_list.txt"
+# 一時ファイルを初期化
+> "$PDF_LIST"
 
 # PDF変換関数（タイムアウト処理を含む）
 convert_to_pdf() {
     local url="$1"
     local output_path="$2"
     
-    if [ "$TIMEOUT_CMD" = "timeout_function" ]; then
-        # 簡易タイムアウト関数を使用
-        timeout_function "$TIMEOUT_SEC" "$CHROME_PATH --headless --disable-gpu --print-to-pdf=\"$output_path\" \"$url\" 2>/dev/null"
-    else
-        # 通常のタイムアウトコマンドを使用
-        $TIMEOUT_CMD "$TIMEOUT_SEC" "$CHROME_PATH" --headless --disable-gpu --print-to-pdf="$output_path" "$url" 2>/dev/null
-    fi
+    # 新しいプロセスグループで実行して、SIGINT (Ctrl+C) が確実に処理されるようにする
+    (
+        if [ "$TIMEOUT_CMD" = "timeout_function" ]; then
+            # 簡易タイムアウト関数を使用
+            timeout_function "$TIMEOUT_SEC" "$CHROME_PATH --headless --disable-gpu --print-to-pdf=\"$output_path\" \"$url\" 2>/dev/null"
+        else
+            # 通常のタイムアウトコマンドを使用
+            $TIMEOUT_CMD "$TIMEOUT_SEC" "$CHROME_PATH" --headless --disable-gpu --print-to-pdf="$output_path" "$url" 2>/dev/null
+        fi
+    )
     
     return $?
 }
@@ -291,6 +334,11 @@ while IFS= read -r url; do
     if convert_to_pdf "$url" "$output_path"; then
         echo "✓ PDF作成成功: $output_path"
         SUCCESS=$((SUCCESS + 1))
+        
+        # PDFマージリストに追加
+        if [ "$MERGE_PDFS" = true ] && [ -f "$output_path" ]; then
+            echo "$output_path" >> "$PDF_LIST"
+        fi
     else
         echo "✗ PDF作成失敗: $url"
         FAILED=$((FAILED + 1))
@@ -318,7 +366,44 @@ while IFS= read -r url; do
 done < "$TEMP_URLS"
 
 #####################################
-# step7. 結果の表示
+# step7. PDFのマージ (オプション)
+#####################################
+if [ "$MERGE_PDFS" = true ] && [ "$SUCCESS" -gt 0 ]; then
+    echo "生成したPDFファイルを1つにまとめています..."
+    merged_output="$OUTPUT_DIR/$MERGED_FILENAME"
+    
+    # ファイルの数を確認
+    pdf_count=$(wc -l < "$PDF_LIST")
+    echo "結合対象のPDFファイル: $pdf_count 件"
+    
+    if [ "$pdf_count" -gt 0 ]; then
+        if [ "$PDF_MERGE_TOOL" = "gs" ]; then
+            # Ghostscriptを使用してPDFをマージ
+            echo "Ghostscriptを使用してPDFを結合しています..."
+            gs -dBATCH -dNOPAUSE -q -sDEVICE=pdfwrite -sOutputFile="$merged_output" $(cat "$PDF_LIST")
+        elif [ "$PDF_MERGE_TOOL" = "pdftk" ]; then
+            # pdftk を使用してPDFをマージ
+            echo "pdftk を使用してPDFを結合しています..."
+            pdftk $(cat "$PDF_LIST") cat output "$merged_output"
+        fi
+        
+        if [ -f "$merged_output" ]; then
+            echo "✓ PDFの結合に成功しました: $merged_output"
+        else
+            echo "✗ PDFの結合に失敗しました。"
+        fi
+    else
+        echo "結合するPDFファイルがありません。"
+    fi
+    
+    # 一時ファイルのクリーンアップ
+    if [ "$DEBUG_MODE" = false ]; then
+        rm -f "$PDF_LIST"
+    fi
+fi
+
+#####################################
+# step8. 結果の表示
 #####################################
 END_TIME=$(date +%s)
 TOTAL_TIME=$((END_TIME - START_TIME))
@@ -329,5 +414,9 @@ echo "成功: $SUCCESS"
 echo "失敗: $FAILED"
 echo "所要時間: ${TOTAL_TIME}秒"
 echo "PDFの出力先: $OUTPUT_DIR"
+
+if [ "$MERGE_PDFS" = true ] && [ -f "$OUTPUT_DIR/$MERGED_FILENAME" ]; then
+    echo "結合されたPDF: $OUTPUT_DIR/$MERGED_FILENAME"
+fi
 
 exit 0
